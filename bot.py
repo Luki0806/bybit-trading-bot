@@ -3,7 +3,7 @@ import time
 import requests
 from flask import Flask, request
 from pybit.unified_trading import HTTP
-from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT
+from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET
 
 app = Flask(__name__)
 port = int(os.environ.get("PORT", 5000))
@@ -12,15 +12,14 @@ session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
 
 processing = False
 last_alert_time = 0
-ALERT_COOLDOWN = 2  # sekundy
-
+last_action = None
+ALERT_COOLDOWN = 4  # sekundy
 
 def send_to_discord(message):
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
     except Exception as e:
         print(f"❌ Błąd wysyłania do Discord: {e}")
-
 
 def get_current_position(symbol):
     try:
@@ -31,50 +30,51 @@ def get_current_position(symbol):
         send_to_discord(f"❗ Błąd pobierania pozycji: {e}")
         return 0.0, "None"
 
-
-def calculate_qty(symbol):
+def calculate_qty(symbol, portion=0.5):
     try:
         balance_data = session.get_wallet_balance(accountType="UNIFIED")
         usdt = next(c for c in balance_data["result"]["list"][0]["coin"] if c["coin"] == "USDT")
-        wallet_balance = float(usdt.get("walletBalance", 0))
-
-        # Zastosuj procent portfela
-        position_value = wallet_balance * POSITION_PERCENT
-
-        # Pobierz cenę instrumentu
-        tickers = session.get_tickers(category="linear")["result"]["list"]
-        price_info = next(i for i in tickers if i["symbol"] == symbol)
-        price = float(price_info["lastPrice"])
-
-        # Oblicz ilość pozycji
-        qty = round(position_value / price)
+        available = float(usdt.get("walletBalance", 0))
+        price_info = next(i for i in session.get_tickers(category="linear")["result"]["list"] if i["symbol"] == symbol)
+        qty = int((available * portion) / float(price_info["lastPrice"]))
         return qty
     except Exception as e:
         send_to_discord(f"❗ Błąd obliczania wielkości pozycji: {e}")
         return None
 
-
 @app.route("/", methods=["GET"])
 def index():
     return "✅ Bot działa!", 200
 
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global processing, last_alert_time
+    global processing, last_alert_time, last_action
 
-    if time.time() - last_alert_time < ALERT_COOLDOWN:
-        return "Cooldown", 429
+    now = time.time()
 
     if processing:
+        send_to_discord("⏳ Alert zignorowany — wciąż przetwarzam poprzedni.")
         return "Still processing", 429
 
-    processing = True
-    last_alert_time = time.time()
+    if now - last_alert_time < ALERT_COOLDOWN:
+        send_to_discord("⏳ Alert zignorowany — zbyt krótki odstęp czasu.")
+        return "Cooldown", 429
 
     try:
         data = request.get_json()
         action = data.get("action", "").lower()
+        if not action:
+            send_to_discord("⚠️ Nieprawidłowy alert: brak pola 'action'")
+            return "No action", 400
+
+        if action == last_action:
+            send_to_discord(f"⚠️ Zignorowano duplikat alertu: {action}")
+            return "Duplicate alert", 429
+
+        processing = True
+        last_alert_time = now
+        last_action = action
+
         size, side = get_current_position(SYMBOL)
 
         if action == "buy" and size == 0:
@@ -100,15 +100,16 @@ def webhook():
             send_to_discord(f"🔒 Zamknięto pozycję SELL ({size})")
 
         else:
-            send_to_discord(f"⚠️ Ignoruję alert '{action.upper()}' — nieodpowiedni kontekst (pozycja: {side}, size: {size})")
+            send_to_discord(f"⚠️ Alert '{action}' zignorowany — nie pasuje do obecnej pozycji ({side}, size: {size})")
 
-        processing = False
         return "OK", 200
 
     except Exception as e:
         send_to_discord(f"❗ Błąd w webhook: {e}")
-        processing = False
         return "Error", 500
+
+    finally:
+        processing = False
 
 
 if __name__ == "__main__":
