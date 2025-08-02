@@ -3,7 +3,7 @@ import time
 import requests
 from flask import Flask, request
 from pybit.unified_trading import HTTP
-from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET
+from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT
 
 app = Flask(__name__)
 port = int(os.environ.get("PORT", 5000))
@@ -36,9 +36,18 @@ def calculate_qty(symbol):
     try:
         balance_data = session.get_wallet_balance(accountType="UNIFIED")
         usdt = next(c for c in balance_data["result"]["list"][0]["coin"] if c["coin"] == "USDT")
-        available = float(usdt.get("walletBalance", 0))
-        price_info = next(i for i in session.get_tickers(category="linear")["result"]["list"] if i["symbol"] == symbol)
-        qty = int((available * 1) / float(price_info["lastPrice"]))
+        wallet_balance = float(usdt.get("walletBalance", 0))
+
+        # Zastosuj procent portfela
+        position_value = wallet_balance * POSITION_PERCENT
+
+        # Pobierz cenę instrumentu
+        tickers = session.get_tickers(category="linear")["result"]["list"]
+        price_info = next(i for i in tickers if i["symbol"] == symbol)
+        price = float(price_info["lastPrice"])
+
+        # Oblicz ilość pozycji
+        qty = round(position_value / price)
         return qty
     except Exception as e:
         send_to_discord(f"❗ Błąd obliczania wielkości pozycji: {e}")
@@ -70,13 +79,15 @@ def webhook():
 
         if action == "buy" and size == 0:
             qty = calculate_qty(SYMBOL)
-            session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market", qty=qty)
-            send_to_discord(f"📈 Otwarto pozycję BUY ({qty})")
+            if qty:
+                session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market", qty=qty)
+                send_to_discord(f"📈 Otwarto pozycję BUY ({qty})")
 
         elif action == "sell" and size == 0:
             qty = calculate_qty(SYMBOL)
-            session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
-            send_to_discord(f"📉 Otwarto pozycję SELL ({qty})")
+            if qty:
+                session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
+                send_to_discord(f"📉 Otwarto pozycję SELL ({qty})")
 
         elif action == "close_buy" and size > 0 and side == "Buy":
             session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market",
