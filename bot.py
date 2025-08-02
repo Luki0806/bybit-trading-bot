@@ -82,7 +82,14 @@ def webhook():
         return "Cooldown", 429
 
     try:
-        data = request.get_json()
+        # Zmodyfikowana sekcja obsługi danych JSON
+        # Po prostu próbujemy załadować JSON z ciała żądania, niezależnie od Content-Type
+        try:
+            data = json.loads(request.data)
+        except json.JSONDecodeError:
+            send_to_discord("⚠️ Nieprawidłowy alert: dane nie są w formacie JSON")
+            return "Invalid JSON", 400
+
         action = data.get("action", "").lower()
         if not action:
             send_to_discord("⚠️ Nieprawidłowy alert: brak pola 'action'")
@@ -111,7 +118,7 @@ def webhook():
             qty = calculate_qty(SYMBOL, POSITION_PERCENT)
             if qty:
                 session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
-                send_to_discord(f"📉 Otwarto pozycję SELL ({qty})")
+                send_to_discord(f"� Otwarto pozycję SELL ({qty})")
 
         elif action == "close_buy" and size > 0 and side == "Buy":
             session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market",
@@ -139,3 +146,4 @@ def webhook():
 if __name__ == "__main__":
     print("🚀 Bot uruchomiony...")
     app.run(host="0.0.0.0", port=port)
+�
