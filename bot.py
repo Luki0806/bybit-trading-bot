@@ -59,6 +59,33 @@ def calculate_qty(symbol, portion):
         send_to_discord(f"❗ Blad obliczania wielkosci pozycji: {e}")
         return None
 
+def retry_close_order(symbol, side, size, retries=5, delay=1):
+    """
+    Probuje zamknac pozycje z mechanizmem ponawiania prob.
+    """
+    for i in range(retries):
+        try:
+            # Strona przeciwna do aktualnej pozycji
+            close_side = "Buy" if side == "Sell" else "Sell"
+            session.place_order(
+                category="linear",
+                symbol=symbol,
+                side=close_side,
+                orderType="Market",
+                qty=size,
+                reduceOnly=True
+            )
+            # Jesli zamkniecie sie powiodlo, wysylamy powiadomienie
+            send_to_discord(f"🔒 Zamknieto pozycje {side.upper()} ({size}) (proba {i+1})")
+            return True # Wracamy, jesli sukces
+        except Exception as e:
+            # W przypadku bledu, czekamy i probujemy ponownie
+            send_to_discord(f"❗ Blad zamykania pozycji: {e} (proba {i+1}/{retries})")
+            time.sleep(delay)
+    # Jesli nie udalo sie po wszystkich probach, wysylamy finalne powiadomienie o bledzie
+    send_to_discord(f"❌ Nie udalo sie zamknac pozycji {side.upper()} ({size}) po {retries} probach.")
+    return False
+
 @app.route("/", methods=["GET"])
 def index():
     """Endpoint testowy dla sprawdzenia, czy bot dziala."""
@@ -71,19 +98,15 @@ def webhook():
 
     now = time.time()
 
-    # Logika sprawdzajaca, czy bot nie przetwarza juz alertu
     if processing:
         send_to_discord("⏳ Alert zignorowany - wciaz przetwarzam poprzedni.")
         return "Still processing", 429
 
-    # Logika sprawdzajaca odstep czasu miedzy alertami
     if now - last_alert_time < ALERT_COOLDOWN:
         send_to_discord("⏳ Alert zignorowany - zbyt krotki odstep czasu.")
         return "Cooldown", 429
 
     try:
-        # Zmodyfikowana sekcja obslugi danych JSON
-        # Po prostu probujemy zaladowac JSON z ciala zadania, niezaleznie od Content-Type
         try:
             data = json.loads(request.data)
         except json.JSONDecodeError:
@@ -95,7 +118,6 @@ def webhook():
             send_to_discord("⚠️ Nieprawidlowy alert: brak pola 'action'")
             return "No action", 400
 
-        # Logika sprawdzajaca duplikaty alertow
         if action == last_action:
             send_to_discord(f"⚠️ Zignorowano duplikat alertu: {action}")
             return "Duplicate alert", 429
@@ -107,28 +129,30 @@ def webhook():
         size, side = get_current_position(SYMBOL)
 
         if action == "buy" and size == 0:
-            # Uzyj POSITION_PERCENT z pliku config
             qty = calculate_qty(SYMBOL, POSITION_PERCENT)
             if qty:
-                session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market", qty=qty)
-                send_to_discord(f"📈 Otwarto pozycje BUY ({qty})")
+                try:
+                    session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market", qty=qty)
+                    send_to_discord(f"📈 Otwarto pozycje BUY ({qty})")
+                except Exception as e:
+                    send_to_discord(f"❗ Blad w webhook: {e}")
+                    return "Error", 500
 
         elif action == "sell" and size == 0:
-            # Uzyj POSITION_PERCENT z pliku config
             qty = calculate_qty(SYMBOL, POSITION_PERCENT)
             if qty:
-                session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
-                send_to_discord(f"📉 Otwarto pozycje SELL ({qty})")
+                try:
+                    session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
+                    send_to_discord(f"📉 Otwarto pozycje SELL ({qty})")
+                except Exception as e:
+                    send_to_discord(f"❗ Blad w webhook: {e}")
+                    return "Error", 500
 
         elif action == "close_buy" and size > 0 and side == "Buy":
-            session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market",
-                                qty=size, reduceOnly=True)
-            send_to_discord(f"🔒 Zamknieto pozycje BUY ({size})")
+            retry_close_order(SYMBOL, "Buy", size)
 
         elif action == "close_sell" and size > 0 and side == "Sell":
-            session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market",
-                                qty=size, reduceOnly=True)
-            send_to_discord(f"🔒 Zamknieto pozycje SELL ({size})")
+            retry_close_order(SYMBOL, "Sell", size)
 
         else:
             send_to_discord(f"⚠️ Alert '{action}' zignorowany - nie pasuje do obecnej pozycji ({side}, size: {size})")
