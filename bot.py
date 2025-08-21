@@ -5,7 +5,7 @@ import json
 from flask import Flask, request
 from pybit.unified_trading import HTTP
 # Zaimportuj zmienne z pliku config
-from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT
+from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT, LEVERAGE
 
 app = Flask(__name__)
 port = int(os.environ.get("PORT", 5000))
@@ -14,7 +14,6 @@ port = int(os.environ.get("PORT", 5000))
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
 
 # ===== Ustawienie dźwigni =====
-LEVERAGE = 2  # <- tutaj ustawiasz dźwignię, np. x2
 try:
     session.set_leverage(category="linear", symbol=SYMBOL, leverage=LEVERAGE)
     print(f"✅ Ustawiono dźwignię x{LEVERAGE} dla {SYMBOL}")
