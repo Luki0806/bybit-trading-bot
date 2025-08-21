@@ -4,9 +4,8 @@ import requests
 import json
 from flask import Flask, request
 from pybit.unified_trading import HTTP
-
-# Zaimportuj zmienne z config.py
-from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT, LEVERAGE
+# Zaimportuj zmienne z pliku config
+from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT
 
 app = Flask(__name__)
 port = int(os.environ.get("PORT", 5000))
@@ -14,19 +13,15 @@ port = int(os.environ.get("PORT", 5000))
 # Inicjalizacja sesji z kluczami API
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
 
-# Ustawienie dźwigni na giełdzie
+# ===== Ustawienie dźwigni =====
+LEVERAGE = 2  # <- tutaj ustawiasz dźwignię, np. x2
 try:
-    session.set_leverage(
-        category="linear",
-        symbol=SYMBOL,
-        buyLeverage=LEVERAGE,
-        sellLeverage=LEVERAGE
-    )
-    print(f"✅ Dźwignia ustawiona na x{LEVERAGE} dla {SYMBOL}")
+    session.set_leverage(category="linear", symbol=SYMBOL, leverage=LEVERAGE)
+    print(f"✅ Ustawiono dźwignię x{LEVERAGE} dla {SYMBOL}")
 except Exception as e:
     print(f"❌ Błąd ustawiania dźwigni: {e}")
 
-# Zmienne globalne do obsługi limitów i duplikatów alertów
+# ===== Zmienne globalne =====
 processing = False
 last_alert_time = 0
 last_action = None
@@ -50,20 +45,13 @@ def get_current_position(symbol):
         return 0.0, "None"
 
 def calculate_qty(symbol, portion):
-    """
-    Oblicza wielkość pozycji na podstawie salda portfela i ustalonego procentu.
-    """
+    """Oblicza wielkość pozycji na podstawie salda portfela i ustalonego procentu."""
     try:
         balance_data = session.get_wallet_balance(accountType="UNIFIED")
         usdt = next(c for c in balance_data["result"]["list"][0]["coin"] if c["coin"] == "USDT")
         available = float(usdt.get("walletBalance", 0))
-
-        # Pobiera aktualną cenę symbolu
         price_info = next(i for i in session.get_tickers(category="linear")["result"]["list"] if i["symbol"] == symbol)
-        price = float(price_info["lastPrice"])
-
-        # Oblicza wielkość pozycji (uwzględnia procent portfela)
-        qty = int((available * portion) / price)
+        qty = int((available * portion) / float(price_info["lastPrice"]))
         return qty
     except Exception as e:
         send_to_discord(f"❗ Błąd obliczania wielkości pozycji: {e}")
@@ -97,7 +85,6 @@ def index():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global processing, last_alert_time, last_action
-
     now = time.time()
 
     if processing:
@@ -133,22 +120,14 @@ def webhook():
         if action == "buy" and size == 0:
             qty = calculate_qty(SYMBOL, POSITION_PERCENT)
             if qty:
-                try:
-                    session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market", qty=qty)
-                    send_to_discord(f"📈 Otwarto pozycję BUY ({qty}) x{LEVERAGE}")
-                except Exception as e:
-                    send_to_discord(f"❗ Błąd w webhook: {e}")
-                    return "Error", 500
+                session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market", qty=qty)
+                send_to_discord(f"📈 Otwarto pozycję BUY ({qty})")
 
         elif action == "sell" and size == 0:
             qty = calculate_qty(SYMBOL, POSITION_PERCENT)
             if qty:
-                try:
-                    session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
-                    send_to_discord(f"📉 Otwarto pozycję SELL ({qty}) x{LEVERAGE}")
-                except Exception as e:
-                    send_to_discord(f"❗ Błąd w webhook: {e}")
-                    return "Error", 500
+                session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
+                send_to_discord(f"📉 Otwarto pozycję SELL ({qty})")
 
         elif action == "close_buy" and size > 0 and side == "Buy":
             retry_close_order(SYMBOL, "Buy", size)
