@@ -153,4 +153,4 @@ def webhook():
 if __name__ == "__main__":
     print("🚀 Bot uruchomiony...")
     # Najpierw ustawiamy dźwignię
-    set_leverage(SYMB_
+    set_leverage(SYMBOL_
