@@ -4,8 +4,9 @@ import requests
 import json
 from flask import Flask, request
 from pybit.unified_trading import HTTP
-# Zaimportuj zmienna POSITION_PERCENT z pliku config
-from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT
+
+# Zaimportuj zmienne z config.py
+from config import API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL, TESTNET, POSITION_PERCENT, LEVERAGE
 
 app = Flask(__name__)
 port = int(os.environ.get("PORT", 5000))
@@ -13,18 +14,30 @@ port = int(os.environ.get("PORT", 5000))
 # Inicjalizacja sesji z kluczami API
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
 
-# Zmienne globalne do obslugi limitow i duplikatow alertow
+# Ustawienie dźwigni na giełdzie
+try:
+    session.set_leverage(
+        category="linear",
+        symbol=SYMBOL,
+        buyLeverage=LEVERAGE,
+        sellLeverage=LEVERAGE
+    )
+    print(f"✅ Dźwignia ustawiona na x{LEVERAGE} dla {SYMBOL}")
+except Exception as e:
+    print(f"❌ Błąd ustawiania dźwigni: {e}")
+
+# Zmienne globalne do obsługi limitów i duplikatów alertów
 processing = False
 last_alert_time = 0
 last_action = None
 ALERT_COOLDOWN = 4  # sekundy
 
 def send_to_discord(message):
-    """Wysyla wiadomosc na kanal Discord."""
+    """Wysyła wiadomość na kanał Discord."""
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
     except Exception as e:
-        print(f"❌ Blad wysylania do Discord: {e}")
+        print(f"❌ Błąd wysyłania do Discord: {e}")
 
 def get_current_position(symbol):
     """Pobiera aktualny rozmiar i kierunek pozycji."""
@@ -33,39 +46,33 @@ def get_current_position(symbol):
         pos = result["result"]["list"][0]
         return float(pos["size"]), pos["side"]
     except Exception as e:
-        send_to_discord(f"❗ Blad pobierania pozycji: {e}")
+        send_to_discord(f"❗ Błąd pobierania pozycji: {e}")
         return 0.0, "None"
 
 def calculate_qty(symbol, portion):
     """
-    Oblicza wielkosc pozycji na podstawie salda portfela i ustalonego procentu.
-    
-    :param symbol: Symbol waluty (np. "WIFUSDT")
-    :param portion: Procent salda do uzycia (np. 0.1 dla 10%)
-    :return: Wielkosc pozycji w jednostkach lub None w przypadku bledu.
+    Oblicza wielkość pozycji na podstawie salda portfela i ustalonego procentu.
     """
     try:
         balance_data = session.get_wallet_balance(accountType="UNIFIED")
-        # Wyszukuje dostepne saldo USDT
         usdt = next(c for c in balance_data["result"]["list"][0]["coin"] if c["coin"] == "USDT")
         available = float(usdt.get("walletBalance", 0))
-        # Pobiera aktualna cene symbolu
+
+        # Pobiera aktualną cenę symbolu
         price_info = next(i for i in session.get_tickers(category="linear")["result"]["list"] if i["symbol"] == symbol)
-        
-        # Oblicza wielkosc pozycji
-        qty = int((available * portion) / float(price_info["lastPrice"]))
+        price = float(price_info["lastPrice"])
+
+        # Oblicza wielkość pozycji (uwzględnia procent portfela)
+        qty = int((available * portion) / price)
         return qty
     except Exception as e:
-        send_to_discord(f"❗ Blad obliczania wielkosci pozycji: {e}")
+        send_to_discord(f"❗ Błąd obliczania wielkości pozycji: {e}")
         return None
 
 def retry_close_order(symbol, side, size, retries=5, delay=1):
-    """
-    Probuje zamknac pozycje z mechanizmem ponawiania prob.
-    """
+    """Próbuje zamknąć pozycję z mechanizmem ponawiania prób."""
     for i in range(retries):
         try:
-            # Strona przeciwna do aktualnej pozycji
             close_side = "Buy" if side == "Sell" else "Sell"
             session.place_order(
                 category="linear",
@@ -75,47 +82,42 @@ def retry_close_order(symbol, side, size, retries=5, delay=1):
                 qty=size,
                 reduceOnly=True
             )
-            # Jesli zamkniecie sie powiodlo, wysylamy powiadomienie
-            send_to_discord(f"🔒 Zamknieto pozycje {side.upper()} ({size}) (proba {i+1})")
-            return True # Wracamy, jesli sukces
+            send_to_discord(f"🔒 Zamknięto pozycję {side.upper()} ({size}) (próba {i+1})")
+            return True
         except Exception as e:
-            # W przypadku bledu, czekamy i probujemy ponownie
-            send_to_discord(f"❗ Blad zamykania pozycji: {e} (proba {i+1}/{retries})")
+            send_to_discord(f"❗ Błąd zamykania pozycji: {e} (próba {i+1}/{retries})")
             time.sleep(delay)
-    # Jesli nie udalo sie po wszystkich probach, wysylamy finalne powiadomienie o bledzie
-    send_to_discord(f"❌ Nie udalo sie zamknac pozycji {side.upper()} ({size}) po {retries} probach.")
+    send_to_discord(f"❌ Nie udało się zamknąć pozycji {side.upper()} ({size}) po {retries} próbach.")
     return False
 
 @app.route("/", methods=["GET"])
 def index():
-    """Endpoint testowy dla sprawdzenia, czy bot dziala."""
-    return "✅ Bot dziala!", 200
+    return "✅ Bot działa!", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Glowny endpoint do odbierania alertow z TradingView."""
     global processing, last_alert_time, last_action
 
     now = time.time()
 
     if processing:
-        send_to_discord("⏳ Alert zignorowany - wciaz przetwarzam poprzedni.")
+        send_to_discord("⏳ Alert zignorowany - wciąż przetwarzam poprzedni.")
         return "Still processing", 429
 
     if now - last_alert_time < ALERT_COOLDOWN:
-        send_to_discord("⏳ Alert zignorowany - zbyt krotki odstep czasu.")
+        send_to_discord("⏳ Alert zignorowany - zbyt krótki odstęp czasu.")
         return "Cooldown", 429
 
     try:
         try:
             data = json.loads(request.data)
         except json.JSONDecodeError:
-            send_to_discord("⚠️ Nieprawidlowy alert: dane nie sa w formacie JSON")
+            send_to_discord("⚠️ Nieprawidłowy alert: dane nie są w formacie JSON")
             return "Invalid JSON", 400
 
         action = data.get("action", "").lower()
         if not action:
-            send_to_discord("⚠️ Nieprawidlowy alert: brak pola 'action'")
+            send_to_discord("⚠️ Nieprawidłowy alert: brak pola 'action'")
             return "No action", 400
 
         if action == last_action:
@@ -133,9 +135,9 @@ def webhook():
             if qty:
                 try:
                     session.place_order(category="linear", symbol=SYMBOL, side="Buy", orderType="Market", qty=qty)
-                    send_to_discord(f"📈 Otwarto pozycje BUY ({qty})")
+                    send_to_discord(f"📈 Otwarto pozycję BUY ({qty}) x{LEVERAGE}")
                 except Exception as e:
-                    send_to_discord(f"❗ Blad w webhook: {e}")
+                    send_to_discord(f"❗ Błąd w webhook: {e}")
                     return "Error", 500
 
         elif action == "sell" and size == 0:
@@ -143,9 +145,9 @@ def webhook():
             if qty:
                 try:
                     session.place_order(category="linear", symbol=SYMBOL, side="Sell", orderType="Market", qty=qty)
-                    send_to_discord(f"📉 Otwarto pozycje SELL ({qty})")
+                    send_to_discord(f"📉 Otwarto pozycję SELL ({qty}) x{LEVERAGE}")
                 except Exception as e:
-                    send_to_discord(f"❗ Blad w webhook: {e}")
+                    send_to_discord(f"❗ Błąd w webhook: {e}")
                     return "Error", 500
 
         elif action == "close_buy" and size > 0 and side == "Buy":
@@ -160,7 +162,7 @@ def webhook():
         return "OK", 200
 
     except Exception as e:
-        send_to_discord(f"❗ Blad w webhook: {e}")
+        send_to_discord(f"❗ Błąd w webhook: {e}")
         return "Error", 500
 
     finally:
