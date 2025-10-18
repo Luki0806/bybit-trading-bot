@@ -106,7 +106,7 @@ def calculate_qty(symbol: str):
             return None
 
         available_usdt = float(usdt.get("walletBalance", 0) or 0)
-        trade_usdt = available_usdt * 1.0  # 100% — zmień wedle ryzyka
+        trade_usdt = available_usdt * 2.0  # 200% — zmień wedle ryzyka
 
         tickers_data = session.get_tickers(category="linear")
         price_info = next((it for it in tickers_data["result"]["list"] if it.get("symbol") == symbol), None)
