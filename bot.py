@@ -153,13 +153,14 @@ def _isclose(a: float, b: float) -> bool:
     except Exception:
         return str(a) == str(b)
 
-# ====================== SL / TP ======================
-def set_tp_sl_safe(symbol: str, side: str, sl_price: float | None, tp_price: float | None):
+# ====================== SL / TP (poprawiona wersja) ======================
+def set_tp_sl_safe(symbol: str, side: str, sl_price: float | None, tp_price: float | None,
+                   *, clear_sl: bool = False, clear_tp: bool = False):
     """
-    Ustawia/kasuje TP i SL dla danej pozycji.
-    - respektuje manualne zmiany jeśli włączone (nie nadpisuje tej samej wartości),
-    - usuwa parametry gdy przyjdzie None,
-    - korzysta z LastPrice jako trigger.
+    Ustawia/kasuje TP i SL dla danej pozycji w pojedynczym wywołaniu set_trading_stop.
+    - None oznacza: nie ruszaj parametru
+    - clear_* = True oznacza: usuń dany parametr
+    - jeśli zmieniasz tylko SL, to dołącz aktualny TP (i odwrotnie)
     """
     global last_sl_value, last_tp_value, last_sl_set_ts, last_tp_set_ts
     try:
@@ -167,6 +168,31 @@ def set_tp_sl_safe(symbol: str, side: str, sl_price: float | None, tp_price: flo
         size, _ = get_current_position(symbol)
         if size <= 0:
             return {"skipped": "no position"}
+
+        want_sl, want_tp = None, None
+
+        # STOP LOSS
+        if clear_sl:
+            want_sl = "0"
+        elif sl_price is not None and sl_price > 0:
+            if (not RESPECT_MANUAL_SL) or (cur_sl is None) or (not _isclose(cur_sl, sl_price)):
+                want_sl = str(sl_price)
+
+        # TAKE PROFIT
+        if clear_tp:
+            want_tp = "0"
+        elif tp_price is not None and tp_price > 0:
+            if (not RESPECT_MANUAL_TP) or (cur_tp is None) or (not _isclose(cur_tp, tp_price)):
+                want_tp = str(tp_price)
+
+        # zachowaj drugi parametr jeśli nie podany
+        if want_sl is not None and want_tp is None and cur_tp is not None and not clear_tp:
+            want_tp = str(cur_tp)
+        if want_tp is not None and want_sl is None and cur_sl is not None and not clear_sl:
+            want_sl = str(cur_sl)
+
+        if want_sl is None and want_tp is None:
+            return {"ok": True, "skipped": "no changes"}
 
         payload = {
             "category": "linear",
@@ -176,34 +202,29 @@ def set_tp_sl_safe(symbol: str, side: str, sl_price: float | None, tp_price: flo
             "slTriggerBy": "LastPrice",
             "tpTriggerBy": "LastPrice",
         }
+        if want_sl is not None:
+            payload["stopLoss"] = want_sl
+        if want_tp is not None:
+            payload["takeProfit"] = want_tp
 
-        # STOP LOSS
-        if sl_price and sl_price > 0:
-            if (not RESPECT_MANUAL_SL) or (cur_sl is None) or (not _isclose(cur_sl, sl_price)):
-                payload["stopLoss"] = str(sl_price)
-                session.set_trading_stop(**payload)
-                last_sl_value = float(sl_price)
-                last_sl_set_ts = time.time()
-                send_to_discord(f"🛡️ Ustawiam SL @ {sl_price} dla {symbol}")
-        elif cur_sl is not None and sl_price is None:
-            payload["stopLoss"] = "0"
-            session.set_trading_stop(**payload)
+        session.set_trading_stop(**payload)
+
+        # Discord + stan
+        if want_sl == "0":
             last_sl_value = None
             send_to_discord(f"🧹 Kasuję SL dla {symbol}")
+        elif isinstance(want_sl, str):
+            last_sl_value = float(want_sl)
+            last_sl_set_ts = time.time()
+            send_to_discord(f"🛡️ Ustawiam SL @ {want_sl} dla {symbol}")
 
-        # TAKE PROFIT
-        if tp_price and tp_price > 0:
-            if (not RESPECT_MANUAL_TP) or (cur_tp is None) or (not _isclose(cur_tp, tp_price)):
-                payload["takeProfit"] = str(tp_price)
-                session.set_trading_stop(**payload)
-                last_tp_value = float(tp_price)
-                last_tp_set_ts = time.time()
-                send_to_discord(f"🎯 Ustawiam TP @ {tp_price} dla {symbol}")
-        elif cur_tp is not None and tp_price is None:
-            payload["takeProfit"] = "0"
-            session.set_trading_stop(**payload)
+        if want_tp == "0":
             last_tp_value = None
             send_to_discord(f"🧹 Kasuję TP dla {symbol}")
+        elif isinstance(want_tp, str):
+            last_tp_value = float(want_tp)
+            last_tp_set_ts = time.time()
+            send_to_discord(f"🎯 Ustawiam TP @ {want_tp} dla {symbol}")
 
         return {"ok": True}
     except Exception as e:
@@ -233,18 +254,15 @@ def webhook():
             return "Ignored non-JSON", 204
 
         action = str(data.get("action", "")).lower().strip()
-        # Normalizacja symbolu (usuwa .P i upper-case)
         symbol_raw = str(data.get("symbol", SYMBOL)).strip() or SYMBOL
         symbol = normalize_symbol(symbol_raw)
 
-        # Walidacja dozwolonych symboli po normalizacji
         if symbol not in ALLOWED_SET:
             send_to_discord(f"🚫 Niedozwolony symbol: {symbol_raw} (po normalizacji: {symbol}). "
                             f"Dozwolone: {', '.join(sorted(ALLOWED_SET))}")
             processing = False
             return jsonify(error="symbol not allowed"), 400
 
-        # Parsowanie SL/TP (opcjonalne)
         sl_val = data.get("sl")
         tp_val = data.get("tp")
         try:
@@ -265,7 +283,6 @@ def webhook():
             processing = False
             return ("", 204)
 
-        # Bieżąca pozycja
         size, side = get_current_position(symbol)
 
         # ===== UNLOCKS =====
@@ -305,12 +322,12 @@ def webhook():
             return jsonify(ok=True), 200
         if action == "clear_sl":
             if size > 0:
-                set_tp_sl_safe(symbol, side, None, None if tp_val is None else (float(tp_val) if tp_val != "" else None))
+                set_tp_sl_safe(symbol, side, None, None, clear_sl=True)
             processing = False
             return jsonify(ok=True), 200
         if action == "clear_tp":
             if size > 0:
-                set_tp_sl_safe(symbol, side, None if sl_val is None else (float(sl_val) if sl_val != "" else None), None)
+                set_tp_sl_safe(symbol, side, None, None, clear_tp=True)
             processing = False
             return jsonify(ok=True), 200
 
@@ -329,7 +346,7 @@ def webhook():
                                 orderType="Market", qty=size, reduceOnly=True,
                                 timeInForce="GoodTillCancel")
             send_to_discord(f"🧯 CLOSE: zamknięto pozycję {side.upper()} ({size} {symbol})")
-            set_tp_sl_safe(symbol, side, None, None)
+            set_tp_sl_safe(symbol, side, None, None, clear_sl=True, clear_tp=True)
             manual_sl_locked = False
             manual_tp_locked = False
             processing = False
@@ -337,7 +354,6 @@ def webhook():
 
         # ===== BUY / SELL =====
         if action in ("buy", "sell"):
-            # Jeśli przeciwna pozycja otwarta — zamknij
             if size > 0 and side in ("Buy", "Sell"):
                 close_side = "Sell" if side == "Buy" else "Buy"
                 session.place_order(category="linear", symbol=symbol, side=close_side,
@@ -346,7 +362,6 @@ def webhook():
                 send_to_discord(f"🔒 Zamknięto pozycję {side.upper()} ({size} {symbol})")
                 time.sleep(1.2)
 
-            # Otwórz nową
             qty = calculate_qty(symbol)
             if not qty:
                 processing = False
@@ -358,7 +373,6 @@ def webhook():
                                 timeInForce="GoodTillCancel")
             send_to_discord(f"📥 Otwarto pozycję {side_new.upper()} ({qty} {symbol})")
 
-            # Ustaw TP/SL z alertu wejściowego (jeśli podane)
             set_tp_sl_safe(symbol, side_new, sl_price, tp_price)
 
             processing = False
