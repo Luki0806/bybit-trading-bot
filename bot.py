@@ -147,8 +147,8 @@ return str(a) == str(b)
 
 # ====================== SL / TP ======================
 
-def set_tp_sl_safe(symbol: str, side: str, sl_price: float | None, tp_price: float | None,
-*, clear_sl: bool = False, clear_tp: bool = False):
+def set_tp_sl_safe(symbol: str, side: str, sl_price=None, tp_price=None,
+clear_sl: bool = False, clear_tp: bool = False):
 global last_sl_value, last_tp_value, last_sl_set_ts, last_tp_set_ts
 try:
 cur_sl, cur_tp, idx = get_sl_tp(symbol)
