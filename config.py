@@ -8,7 +8,7 @@ API_SECRET = "qSWZc6ca2IeOjoQQDz82EZQCvMAePkIpPQvV"
 # ⚙️ PARAMETRY BOTA
 # ======================
 SYMBOL = "WIFUSDT"  # Domyślny symbol
-ALLOWED_SYMBOLS = ["WIFUSDT", "COAIUSDT", "ZECUSDT","ZKUSDT"]  # Lista dozwolonych symboli
+ALLOWED_SYMBOLS = ["WIFUSDT", "COAIUSDT", "ZECUSDT","ZKUSDT","NEARUSDT"]  # Lista dozwolonych symboli
 TESTNET = False  # False = konto realne, True = testnet
 
 # ======================
