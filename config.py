@@ -14,7 +14,7 @@ TESTNET = False  # False = konto realne, True = testnet
 # ======================
 # 💬 POWIADOMIENIA
 # ======================
-DISCORD_WEBHOOK_URL = "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$"
+DISCORD_WEBHOOK_URL = "https://bybit-trading-bot-uxka.onrender.com/webhook"
 
 # ======================
 # 💰 DOMYŚLNY TRYB HANDLU
