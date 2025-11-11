@@ -24,6 +24,6 @@ DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1396430612960772126/eO-1
 POSITION_MODE = "PERCENT"   # "PERCENT" lub "SIZE"
 POSITION_VALUE = 1.0        # 1.0 = 100% kapitału lub np. 100 = 100 sztuk w trybie SIZE
 
-LEVERAGE = 1           # dźwignia dla kontraktów linear
+LEVERAGE = 5           # dźwignia dla kontraktów linear
 AUTOSCALE_QTY = True   # automatycznie zmniejsz ilość, gdy brakuje marginu
-SAFETY_MARGIN = 0.95   # nie używaj 100% dostępnego marginu
+SAFETY_MARGIN = 0.19   # nie używaj 19% dostępnego marginu
