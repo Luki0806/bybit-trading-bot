@@ -19,12 +19,8 @@ def normalize_symbol(sym: str) -> str:
 try:
     from config import (
         API_KEY, API_SECRET, SYMBOL, DISCORD_WEBHOOK_URL,
-        TESTNET, ALLOWED_SYMBOLS, POSITION_MODE, POSITION_VALUE
+        TESTNET, ALLOWED_SYMBOLS, POSITION_VALUE
     )
-    # opcjonalne (jeśli nie ma w config, damy domyślne)
-    LEVERAGE = getattr(__import__("config"), "LEVERAGE", 5)  # domyślnie x5
-    AUTOSCALE_QTY = getattr(__import__("config"), "AUTOSCALE_QTY", True)
-    SAFETY_MARGIN = getattr(__import__("config"), "SAFETY_MARGIN", 0.95)  # 95% dost. marginu
 except Exception:
     API_KEY = os.environ.get("API_KEY", "")
     API_SECRET = os.environ.get("API_SECRET", "")
@@ -32,11 +28,7 @@ except Exception:
     DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
     TESTNET = os.environ.get("TESTNET", "true").lower() in ("1","true","yes")
     ALLOWED_SYMBOLS = [s.strip() for s in os.environ.get("ALLOWED_SYMBOLS","WIFUSDT,COAIUSDT").split(",") if s.strip()]
-    POSITION_MODE = os.environ.get("POSITION_MODE","PERCENT").upper()
     POSITION_VALUE = float(os.environ.get("POSITION_VALUE","1.0"))
-    LEVERAGE = int(os.environ.get("LEVERAGE", "5"))
-    AUTOSCALE_QTY = os.environ.get("AUTOSCALE_QTY","true").lower() in ("1","true","yes")
-    SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","0.95"))
 
 ALLOWED_SET = {normalize_symbol(s) for s in (ALLOWED_SYMBOLS or [])}
 PORT = int(os.environ.get("PORT", 5000))
@@ -107,12 +99,6 @@ def quantize_qty(qty: float, lot_step: float, min_qty: float) -> float:
         return 0.0
     return float(f"{q:.10f}")
 
-def set_leverage(symbol: str, leverage: int):
-    try:
-        session.set_leverage(category="linear", symbol=symbol, buyLeverage=str(leverage), sellLeverage=str(leverage))
-    except Exception as e:
-        send_to_discord(f"⚠️ set_leverage warn: {e}")
-
 # ====================== USTAWIENIE SL/TP (bez pustych requestów) ======================
 def set_tp_sl_safe(symbol, sl, tp):
     try:
@@ -131,20 +117,25 @@ def set_tp_sl_safe(symbol, sl, tp):
             "slTriggerBy": "LastPrice",
             "tpTriggerBy": "LastPrice"
         }
-        if sl: payload["stopLoss"] = str(sl)
-        if tp: payload["takeProfit"] = str(tp)
+        if sl:
+            payload["stopLoss"] = str(sl)
+        if tp:
+            payload["takeProfit"] = str(tp)
         session.set_trading_stop(**payload)
-        if sl: send_to_discord(f"🛡️ SL @ {sl}")
-        if tp: send_to_discord(f"🎯 TP @ {tp}")
+        if sl:
+            send_to_discord(f"🛡️ SL @ {sl}")
+        if tp:
+            send_to_discord(f"🎯 TP @ {tp}")
     except Exception as e:
         send_to_discord(f"❗ set_tp_sl_safe error: {e}")
 
-# ====================== WYLICZANIE ILOŚCI ======================
-def calculate_qty(symbol: str, mode: str, value: float):
+# ====================== WYLICZANIE ILOŚCI (TYLKO PROCENT) ======================
+def calculate_qty(symbol: str, percent: float):
     """
     Zwraca (qty, notional_usdt).
-    - PERCENT: używa availableBalance i dźwigni (LEVERAGE), normalizuje 100->1.0
-    - SIZE: skaluje do dostępnego marginesu i lot step
+    - ZAWSZE procent dostępnego salda (UNIFIED / USDT)
+    - percent: 1.0 = 100%, 0.25 = 25%, 0.5 = 50% itd.
+      Jeśli ktoś poda >1, traktujemy jako % (np. 25 = 25%).
     """
     try:
         inst = get_instrument(symbol)
@@ -161,9 +152,6 @@ def calculate_qty(symbol: str, mode: str, value: float):
             send_to_discord("❗ Brak ceny rynkowej.")
             return None, None
 
-        # dźwignia (nie blokująca – jeśli się nie powiedzie, kontynuujemy)
-        set_leverage(symbol, LEVERAGE)
-
         # saldo
         wb = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["coin"]
         usdt = next((c for c in wb if c.get("coin") == "USDT"), None)
@@ -172,22 +160,14 @@ def calculate_qty(symbol: str, mode: str, value: float):
             return None, None
         available = float(usdt.get("availableBalance") or usdt.get("walletBalance") or 0.0)
 
-        # normalizacja procentu (jeśli user poda 50 → 50%)
-        if mode == "PERCENT":
-            v = float(value)
-            v = v / 100.0 if v > 1.0 else v
-            v = max(0.0, min(1.0, v))
-            target_notional = available * v * LEVERAGE * SAFETY_MARGIN
-            raw_qty = target_notional / last_price
-        else:  # SIZE
-            raw_qty = float(value)
-            target_notional = raw_qty * last_price
+        # normalizacja procentu
+        v = float(percent)
+        if v > 1.0:
+            v = v / 100.0  # 25 => 25%
+        v = max(0.0, min(1.0, v))
 
-        # limit wg dostępnego marginesu
-        max_qty_by_margin = (available * LEVERAGE * SAFETY_MARGIN) / last_price
-        if AUTOSCALE_QTY and raw_qty > max_qty_by_margin:
-            send_to_discord(f"⚠️ Autoscale: zmniejszam ilość z {raw_qty:.6f} do {max_qty_by_margin:.6f} (margin).")
-            raw_qty = max_qty_by_margin
+        target_notional = available * v
+        raw_qty = target_notional / last_price
 
         # lotStep/minQty
         qty = quantize_qty(raw_qty, qty_step, min_qty)
@@ -196,12 +176,10 @@ def calculate_qty(symbol: str, mode: str, value: float):
             return None, None
 
         final_notional = qty * last_price
-        if mode == "PERCENT":
-            send_to_discord(f"📊 Tryb: PERCENT → {qty} {symbol} ≈ {final_notional:.2f} USDT "
-                            f"(avail {available:.2f} USDT, lev x{LEVERAGE})")
-        else:
-            send_to_discord(f"📊 Tryb: SIZE → {qty} {symbol} ≈ {final_notional:.2f} USDT "
-                            f"(avail {available:.2f} USDT, lev x{LEVERAGE})")
+        send_to_discord(
+            f"📊 Tryb: PERCENT ({v*100:.2f}%) → {qty} {symbol} ≈ {final_notional:.2f} USDT "
+            f"(avail {available:.2f} USDT)"
+        )
 
         return qty, final_notional
 
@@ -236,18 +214,8 @@ def webhook():
         sl = float(data.get("sl") or 0) or None
         tp = float(data.get("tp") or 0) or None
 
-        # TRYB z alertu lub fallback z config
-        mode_override = str(data.get("mode","")).upper().strip()
-        value_override = data.get("value", None)
-        if mode_override in ("PERCENT","SIZE"):
-            mode_active = mode_override
-            try:
-                value_active = float(value_override)
-            except Exception:
-                value_active = POSITION_VALUE
-        else:
-            mode_active = POSITION_MODE
-            value_active = POSITION_VALUE
+        # ZAWSZE TRYB PROCENTOWY Z CONFIGU
+        percent = POSITION_VALUE
 
         size, side, entry = get_current_position(symbol)
 
@@ -263,14 +231,21 @@ def webhook():
                 pnl_pct = ((last - entry)/entry*100) if side == "Buy" else ((entry - last)/entry*100)
             close_side = "Sell" if side == "Buy" else "Buy"
             try:
-                session.place_order(category="linear", symbol=symbol, side=close_side,
-                                    orderType="Market", qty=size, reduceOnly=True,
-                                    timeInForce="GoodTillCancel")
+                session.place_order(
+                    category="linear",
+                    symbol=symbol,
+                    side=close_side,
+                    orderType="Market",
+                    qty=size,
+                    reduceOnly=True,
+                    timeInForce="GoodTillCancel"
+                )
             except Exception as e:
                 send_to_discord(f"❗ CLOSE error: {e}")
             sign = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
-            send_to_discord(f"🧯 CLOSE: {side.upper()} {size} {symbol} ≈ {notional:.2f} USDT ({sign}{pnl_pct:.2f}%)")
-            # nie wysyłamy pustego set_trading_stop
+            send_to_discord(
+                f"🧯 CLOSE: {side.upper()} {size} {symbol} ≈ {notional:.2f} USDT ({sign}{pnl_pct:.2f}%)"
+            )
             processing = False
             return jsonify(ok=True), 200
 
@@ -280,16 +255,22 @@ def webhook():
             if size > 0:
                 close_side = "Sell" if side == "Buy" else "Buy"
                 try:
-                    session.place_order(category="linear", symbol=symbol, side=close_side,
-                                        orderType="Market", qty=size, reduceOnly=True,
-                                        timeInForce="GoodTillCancel")
+                    session.place_order(
+                        category="linear",
+                        symbol=symbol,
+                        side=close_side,
+                        orderType="Market",
+                        qty=size,
+                        reduceOnly=True,
+                        timeInForce="GoodTillCancel"
+                    )
                     send_to_discord(f"🔒 Zamknięto {side.upper()} {size} {symbol}")
                     time.sleep(1.0)
                 except Exception as e:
                     send_to_discord(f"❗ Close-prev error: {e}")
 
-            # wylicz ilość
-            qty, notional = calculate_qty(symbol, mode_active, value_active)
+            # wylicz ilość (TYLKO PROCENT)
+            qty, notional = calculate_qty(symbol, percent)
             if not qty:
                 processing = False
                 return "Invalid qty", 400
@@ -303,14 +284,20 @@ def webhook():
                 return jsonify(error="symbol not tradable"), 400
 
             try:
-                session.place_order(category="linear", symbol=symbol, side=new_side,
-                                    orderType="Market", qty=qty, timeInForce="GoodTillCancel")
+                session.place_order(
+                    category="linear",
+                    symbol=symbol,
+                    side=new_side,
+                    orderType="Market",
+                    qty=qty,
+                    timeInForce="GoodTillCancel"
+                )
             except Exception as e:
                 send_to_discord(f"❗ place_order error: {e}")
                 processing = False
                 return "Order error", 400
 
-            msg = f"📥 Otwarto {new_side.upper()} ({qty} {symbol}) ≈ {notional:.2f} USDT ({mode_active} {value_active})"
+            msg = f"📥 Otwarto {new_side.upper()} ({qty} {symbol}) ≈ {notional:.2f} USDT (PERCENT {percent})"
             send_to_discord(msg)
 
             # ustaw TP/SL jeśli są
@@ -330,5 +317,5 @@ def webhook():
 if __name__ == "__main__":
     print("🚀 Bot uruchomiony…")
     print(f"✅ Dozwolone pary: {', '.join(sorted(ALLOWED_SET))}")
-    print(f"📈 Domyślny tryb: {POSITION_MODE}, wartość: {POSITION_VALUE}, dźwignia x{LEVERAGE}")
+    print(f"📈 Tryb: PERCENT, wartość: {POSITION_VALUE}")
     app.run(host="0.0.0.0", port=PORT)
