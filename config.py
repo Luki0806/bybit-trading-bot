@@ -19,4 +19,4 @@ DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1396430612960772126/eO-1
 # ======================
 # 💰 TRYB HANDLU (TYLKO PROCENT)
 # ======================
-POSITION_VALUE = 1.0   # 1.0 = 100% dostępnego kapitału
+POSITION_VALUE = 0.9   # 1.0 = 100% dostępnego kapitału
