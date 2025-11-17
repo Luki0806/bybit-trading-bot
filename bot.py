@@ -3,6 +3,8 @@ import time
 import math
 import json
 import requests
+import threading
+from queue import Queue
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
 
@@ -26,9 +28,12 @@ except Exception:
     API_SECRET = os.environ.get("API_SECRET", "")
     SYMBOL = os.environ.get("SYMBOL", "BTCUSDT")
     DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-    TESTNET = os.environ.get("TESTNET", "true").lower() in ("1","true","yes")
-    ALLOWED_SYMBOLS = [s.strip() for s in os.environ.get("ALLOWED_SYMBOLS","WIFUSDT,COAIUSDT").split(",") if s.strip()]
-    POSITION_VALUE = float(os.environ.get("POSITION_VALUE","1.0"))
+    TESTNET = os.environ.get("TESTNET", "true").lower() in ("1", "true", "yes")
+    ALLOWED_SYMBOLS = [
+        s.strip() for s in os.environ.get("ALLOWED_SYMBOLS", "WIFUSDT,COAIUSDT").split(",")
+        if s.strip()
+    ]
+    POSITION_VALUE = float(os.environ.get("POSITION_VALUE", "1.0"))
 
 ALLOWED_SET = {normalize_symbol(s) for s in (ALLOWED_SYMBOLS or [])}
 PORT = int(os.environ.get("PORT", 5000))
@@ -36,7 +41,8 @@ PORT = int(os.environ.get("PORT", 5000))
 app = Flask(__name__)
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
 
-processing = False
+# ====================== KOLEJKA ZDARZEŃ ======================
+event_queue: Queue = Queue()
 
 # ====================== POMOCNICZE ======================
 def send_to_discord(message: str):
@@ -102,13 +108,16 @@ def quantize_qty(qty: float, lot_step: float, min_qty: float) -> float:
 # ====================== USTAWIENIE SL/TP (bez pustych requestów) ======================
 def set_tp_sl_safe(symbol, sl, tp):
     try:
-        if not sl and not tp:
-            return  # nic nie ustawiamy
+        # nic nie ustawiamy, jeśli oba brak
+        if sl is None and tp is None:
+            return
+
         res = session.get_positions(category="linear", symbol=symbol)
-        items = res["result"]["list"]
+        items = (res or {}).get("result", {}).get("list", []) or []
         if not items:
             return
-        idx = int(items[0]["positionIdx"])
+
+        idx = int(items[0].get("positionIdx", 0))
         payload = {
             "category": "linear",
             "symbol": symbol,
@@ -117,14 +126,18 @@ def set_tp_sl_safe(symbol, sl, tp):
             "slTriggerBy": "LastPrice",
             "tpTriggerBy": "LastPrice"
         }
-        if sl:
+
+        if sl is not None:
             payload["stopLoss"] = str(sl)
-        if tp:
+        if tp is not None:
             payload["takeProfit"] = str(tp)
-        session.set_trading_stop(**payload)
-        if sl:
+
+        if "stopLoss" in payload or "takeProfit" in payload:
+            session.set_trading_stop(**payload)
+
+        if sl is not None:
             send_to_discord(f"🛡️ SL @ {sl}")
-        if tp:
+        if tp is not None:
             send_to_discord(f"🎯 TP @ {tp}")
     except Exception as e:
         send_to_discord(f"❗ set_tp_sl_safe error: {e}")
@@ -187,48 +200,74 @@ def calculate_qty(symbol: str, percent: float):
         send_to_discord(f"❗ calculate_qty error: {e}")
         return None, None
 
-# ====================== FLASK ROUTES ======================
-@app.get("/")
-def index():
-    return "✅ Bot działa!", 200
+# ====================== GŁÓWNA LOGIKA PRZETWARZANIA ALERTU ======================
+def process_event(data: dict):
+    if not isinstance(data, dict):
+        return
 
-@app.post("/webhook")
-def webhook():
-    global processing
-    if processing:
-        return "Processing in progress", 429
-    processing = True
+    action = str(data.get("action", "")).lower()
+    symbol = normalize_symbol(data.get("symbol", SYMBOL))
+
+    if symbol not in ALLOWED_SET:
+        send_to_discord(f"🚫 Niedozwolony symbol: {symbol}")
+        return
+
+    # SL aktualnie nieużywany przez strategię – ale zostawiony na przyszłość
+    sl = data.get("sl", None)
+    tp = data.get("tp", None)
+
     try:
-        data = parse_incoming_json()
-        if not isinstance(data, dict):
-            processing = False
-            return ("", 204)
+        sl = float(sl) if sl is not None else None
+    except Exception:
+        sl = None
 
-        action = str(data.get("action","")).lower()
-        symbol = normalize_symbol(data.get("symbol", SYMBOL))
-        if symbol not in ALLOWED_SET:
-            send_to_discord(f"🚫 Niedozwolony symbol: {symbol}")
-            processing = False
-            return jsonify(error="symbol not allowed"), 400
+    try:
+        tp = float(tp) if tp is not None else None
+    except Exception:
+        tp = None
 
-        sl = float(data.get("sl") or 0) or None
-        tp = float(data.get("tp") or 0) or None
+    percent = POSITION_VALUE
+    size, side, entry = get_current_position(symbol)
 
-        # ZAWSZE TRYB PROCENTOWY Z CONFIGU
-        percent = POSITION_VALUE
+    # ===== CLOSE =====
+    if action == "close":
+        if size <= 0:
+            # brak pozycji, nic do zamknięcia
+            return
 
-        size, side, entry = get_current_position(symbol)
+        last = get_last_price(symbol)
+        notional = size * last
+        pnl_pct = 0.0
+        if entry > 0:
+            if side == "Buy":
+                pnl_pct = (last - entry) / entry * 100
+            else:
+                pnl_pct = (entry - last) / entry * 100
 
-        # ===== CLOSE =====
-        if action == "close":
-            if size <= 0:
-                processing = False
-                return ("", 204)
-            last = get_last_price(symbol)
-            notional = size * last
-            pnl_pct = 0.0
-            if entry > 0:
-                pnl_pct = ((last - entry)/entry*100) if side == "Buy" else ((entry - last)/entry*100)
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            session.place_order(
+                category="linear",
+                symbol=symbol,
+                side=close_side,
+                orderType="Market",
+                qty=size,
+                reduceOnly=True,
+                timeInForce="GoodTillCancel"
+            )
+        except Exception as e:
+            send_to_discord(f"❗ CLOSE error: {e}")
+
+        sign = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
+        send_to_discord(
+            f"🧯 CLOSE: {side.upper()} {size} {symbol} ≈ {notional:.2f} USDT ({sign}{pnl_pct:.2f}%)"
+        )
+        return
+
+    # ===== BUY / SELL =====
+    if action in ("buy", "sell"):
+        # zamknij odwrotną / każdą istniejącą pozycję
+        if size > 0:
             close_side = "Sell" if side == "Buy" else "Buy"
             try:
                 session.place_order(
@@ -240,79 +279,80 @@ def webhook():
                     reduceOnly=True,
                     timeInForce="GoodTillCancel"
                 )
+                send_to_discord(f"🔒 Zamknięto {side.upper()} {size} {symbol}")
+                # lekki oddech na Bybit
+                time.sleep(1.0)
             except Exception as e:
-                send_to_discord(f"❗ CLOSE error: {e}")
-            sign = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
-            send_to_discord(
-                f"🧯 CLOSE: {side.upper()} {size} {symbol} ≈ {notional:.2f} USDT ({sign}{pnl_pct:.2f}%)"
+                send_to_discord(f"❗ Close-prev error: {e}")
+
+        # wylicz ilość (TYLKO PROCENT)
+        qty, notional = calculate_qty(symbol, percent)
+        if not qty:
+            return
+
+        new_side = "Buy" if action == "buy" else "Sell"
+
+        # pre-check instrumentu (whitelist / status)
+        inst = get_instrument(symbol)
+        if not inst:
+            send_to_discord("🚫 Symbol nie jest tradowalny (brak instrumentu).")
+            return
+
+        try:
+            session.place_order(
+                category="linear",
+                symbol=symbol,
+                side=new_side,
+                orderType="Market",
+                qty=qty,
+                timeInForce="GoodTillCancel"
             )
-            processing = False
-            return jsonify(ok=True), 200
+        except Exception as e:
+            send_to_discord(f"❗ place_order error: {e}")
+            return
 
-        # ===== BUY / SELL =====
-        if action in ("buy","sell"):
-            # zamknij odwrotną
-            if size > 0:
-                close_side = "Sell" if side == "Buy" else "Buy"
-                try:
-                    session.place_order(
-                        category="linear",
-                        symbol=symbol,
-                        side=close_side,
-                        orderType="Market",
-                        qty=size,
-                        reduceOnly=True,
-                        timeInForce="GoodTillCancel"
-                    )
-                    send_to_discord(f"🔒 Zamknięto {side.upper()} {size} {symbol}")
-                    time.sleep(1.0)
-                except Exception as e:
-                    send_to_discord(f"❗ Close-prev error: {e}")
+        msg = f"📥 Otwarto {new_side.upper()} ({qty} {symbol}) ≈ {notional:.2f} USDT (PERCENT {percent})"
+        send_to_discord(msg)
 
-            # wylicz ilość (TYLKO PROCENT)
-            qty, notional = calculate_qty(symbol, percent)
-            if not qty:
-                processing = False
-                return "Invalid qty", 400
+        # ustaw TP/SL jeśli są (Twoja strategia wysyła aktualnie TYLKO TP)
+        set_tp_sl_safe(symbol, sl, tp)
 
-            new_side = "Buy" if action == "buy" else "Sell"
+        return
 
-            # pre-check instrumentu (whitelist / status)
-            inst = get_instrument(symbol)
-            if not inst:
-                processing = False
-                return jsonify(error="symbol not tradable"), 400
+    # inne akcje ignorujemy (na razie)
+    send_to_discord(f"ℹ️ Nieznana akcja: {action}")
 
-            try:
-                session.place_order(
-                    category="linear",
-                    symbol=symbol,
-                    side=new_side,
-                    orderType="Market",
-                    qty=qty,
-                    timeInForce="GoodTillCancel"
-                )
-            except Exception as e:
-                send_to_discord(f"❗ place_order error: {e}")
-                processing = False
-                return "Order error", 400
+# ====================== WORKER KOLEJKI ======================
+def worker():
+    while True:
+        event = event_queue.get()
+        try:
+            process_event(event)
+        except Exception as e:
+            send_to_discord(f"❗ Worker error: {e}")
+        finally:
+            event_queue.task_done()
 
-            msg = f"📥 Otwarto {new_side.upper()} ({qty} {symbol}) ≈ {notional:.2f} USDT (PERCENT {percent})"
-            send_to_discord(msg)
+# start workera w tle
+threading.Thread(target=worker, daemon=True).start()
 
-            # ustaw TP/SL jeśli są
-            set_tp_sl_safe(symbol, sl, tp)
+# ====================== FLASK ROUTES ======================
+@app.get("/")
+def index():
+    return "✅ Bot działa!", 200
 
-            processing = False
-            return jsonify(ok=True), 200
+@app.post("/webhook")
+def webhook():
+    data = parse_incoming_json()
+    if not isinstance(data, dict):
+        # brak poprawnego JSONa – nic nie dodajemy do kolejki
+        return ("", 204)
 
-        processing = False
-        return jsonify(ok=True), 200
+    # 🔥 żadnych blokad, żadnego pomijania – wszystko ląduje w kolejce
+    event_queue.put(data)
 
-    except Exception as e:
-        send_to_discord(f"❗ System error: {e}")
-        processing = False
-        return "Webhook error", 500
+    # HTTP 200 = TradingView uważa, że alert przyjęty
+    return jsonify(ok=True), 200
 
 if __name__ == "__main__":
     print("🚀 Bot uruchomiony…")
