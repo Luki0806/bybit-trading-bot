@@ -7,6 +7,7 @@ import threading
 from queue import Queue
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
+from collections import defaultdict
 
 # ====================== NARZĘDZIA / NORMALIZACJA ======================
 def normalize_symbol(sym: str) -> str:
@@ -38,11 +39,21 @@ except Exception:
 ALLOWED_SET = {normalize_symbol(s) for s in (ALLOWED_SYMBOLS or [])}
 PORT = int(os.environ.get("PORT", 5000))
 
+# 🔒 ANTY-FLIP / ANTY-DUPLIKAT – KONFIG
+MIN_SECONDS_BETWEEN_SAME_ACTION = float(os.environ.get("MIN_SECONDS_BETWEEN_SAME_ACTION", "0.5"))
+MIN_HOLD_SECONDS_AFTER_OPEN = float(os.environ.get("MIN_HOLD_SECONDS_AFTER_OPEN", "3.0"))
+
 app = Flask(__name__)
 session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
 
 # ====================== KOLEJKA ZDARZEŃ ======================
 event_queue: Queue = Queue()
+
+# ====================== STAN WEWNĘTRZNY (ANTY-FLIP) ======================
+# kiedy ostatnio OTWORZYLIŚMY pozycję na danym symbolu
+last_open_time = {}              # symbol -> timestamp
+# ostatnia akcja tego samego typu na symbolu (do anty-duplikatu)
+last_action_time = {}            # (symbol, action) -> timestamp
 
 # ====================== POMOCNICZE ======================
 def send_to_discord(message: str):
@@ -108,7 +119,6 @@ def quantize_qty(qty: float, lot_step: float, min_qty: float) -> float:
 # ====================== USTAWIENIE SL/TP (bez pustych requestów) ======================
 def set_tp_sl_safe(symbol, sl, tp):
     try:
-        # nic nie ustawiamy, jeśli oba brak
         if sl is None and tp is None:
             return
 
@@ -165,7 +175,6 @@ def calculate_qty(symbol: str, percent: float):
             send_to_discord("❗ Brak ceny rynkowej.")
             return None, None
 
-        # saldo
         wb = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["coin"]
         usdt = next((c for c in wb if c.get("coin") == "USDT"), None)
         if not usdt:
@@ -173,16 +182,14 @@ def calculate_qty(symbol: str, percent: float):
             return None, None
         available = float(usdt.get("availableBalance") or usdt.get("walletBalance") or 0.0)
 
-        # normalizacja procentu
         v = float(percent)
         if v > 1.0:
-            v = v / 100.0  # 25 => 25%
+            v = v / 100.0
         v = max(0.0, min(1.0, v))
 
         target_notional = available * v
         raw_qty = target_notional / last_price
 
-        # lotStep/minQty
         qty = quantize_qty(raw_qty, qty_step, min_qty)
         if qty <= 0:
             send_to_discord("❗ Ilość po zaokrągleniu < minQty. Zlecenie pominięte.")
@@ -212,7 +219,6 @@ def process_event(data: dict):
         send_to_discord(f"🚫 Niedozwolony symbol: {symbol}")
         return
 
-    # SL aktualnie nieużywany przez strategię – ale zostawiony na przyszłość
     sl = data.get("sl", None)
     tp = data.get("tp", None)
 
@@ -226,13 +232,32 @@ def process_event(data: dict):
     except Exception:
         tp = None
 
+    # 🔒 ANTY-DUPLIKAT TEJ SAMEJ AKCJI W KRÓTKIM CZASIE
+    now = time.time()
+    key = (symbol, action)
+    last_ts = last_action_time.get(key)
+    if last_ts is not None and now - last_ts < MIN_SECONDS_BETWEEN_SAME_ACTION:
+        send_to_discord(
+            f"⏱️ Zignorowano duplikat akcji {action.upper()} dla {symbol} "
+            f"({now - last_ts:.2f}s od poprzedniej)."
+        )
+        return
+    last_action_time[key] = now
+
     percent = POSITION_VALUE
     size, side, entry = get_current_position(symbol)
 
     # ===== CLOSE =====
     if action == "close":
+        # 🔒 ANTY-FLIP: nie zamykaj pozycji natychmiast po otwarciu
+        open_ts = last_open_time.get(symbol)
+        if open_ts is not None and now - open_ts < MIN_HOLD_SECONDS_AFTER_OPEN:
+            send_to_discord(
+                f"⏱️ CLOSE dla {symbol} odrzucony ({now - open_ts:.2f}s po OTWARCIU) – anty-flip."
+            )
+            return
+
         if size <= 0:
-            # brak pozycji, nic do zamknięcia
             return
 
         last = get_last_price(symbol)
@@ -266,7 +291,19 @@ def process_event(data: dict):
 
     # ===== BUY / SELL =====
     if action in ("buy", "sell"):
-        # zamknij odwrotną / każdą istniejącą pozycję
+        # 🔒 JEŚLI JUŻ JESTEŚMY W TEJ SAMEJ POZYCJI – NIE RÓB NIC WIĘCEJ
+        if size > 0 and (
+            (side == "Buy" and action == "buy") or
+            (side == "Sell" and action == "sell")
+        ):
+            send_to_discord(
+                f"ℹ️ Już w pozycji {side.upper()} na {symbol} – "
+                f"pomijam nowe OTWARCIE, ewentualnie aktualizuję TP/SL."
+            )
+            set_tp_sl_safe(symbol, sl, tp)
+            return
+
+        # zamknij odwrotną pozycję (jeśli jest)
         if size > 0:
             close_side = "Sell" if side == "Buy" else "Buy"
             try:
@@ -280,7 +317,6 @@ def process_event(data: dict):
                     timeInForce="GoodTillCancel"
                 )
                 send_to_discord(f"🔒 Zamknięto {side.upper()} {size} {symbol}")
-                # lekki oddech na Bybit
                 time.sleep(1.0)
             except Exception as e:
                 send_to_discord(f"❗ Close-prev error: {e}")
@@ -292,7 +328,6 @@ def process_event(data: dict):
 
         new_side = "Buy" if action == "buy" else "Sell"
 
-        # pre-check instrumentu (whitelist / status)
         inst = get_instrument(symbol)
         if not inst:
             send_to_discord("🚫 Symbol nie jest tradowalny (brak instrumentu).")
@@ -311,12 +346,17 @@ def process_event(data: dict):
             send_to_discord(f"❗ place_order error: {e}")
             return
 
-        msg = f"📥 Otwarto {new_side.upper()} ({qty} {symbol}) ≈ {notional:.2f} USDT (PERCENT {percent})"
+        msg = (
+            f"📥 Otwarto {new_side.upper()} ({qty} {symbol}) ≈ {notional:.2f} USDT "
+            f"(PERCENT {percent})"
+        )
         send_to_discord(msg)
 
-        # ustaw TP/SL jeśli są (Twoja strategia wysyła aktualnie TYLKO TP)
-        set_tp_sl_safe(symbol, sl, tp)
+        # zapamiętujemy czas OTWARCIA – do anty-flip CLOSE
+        last_open_time[symbol] = time.time()
 
+        # ustaw TP/SL jeśli są
+        set_tp_sl_safe(symbol, sl, tp)
         return
 
     # inne akcje ignorujemy (na razie)
@@ -333,7 +373,6 @@ def worker():
         finally:
             event_queue.task_done()
 
-# start workera w tle
 threading.Thread(target=worker, daemon=True).start()
 
 # ====================== FLASK ROUTES ======================
@@ -345,17 +384,14 @@ def index():
 def webhook():
     data = parse_incoming_json()
     if not isinstance(data, dict):
-        # brak poprawnego JSONa – nic nie dodajemy do kolejki
         return ("", 204)
 
-    # 🔥 żadnych blokad, żadnego pomijania – wszystko ląduje w kolejce
     event_queue.put(data)
-
-    # HTTP 200 = TradingView uważa, że alert przyjęty
     return jsonify(ok=True), 200
 
 if __name__ == "__main__":
     print("🚀 Bot uruchomiony…")
     print(f"✅ Dozwolone pary: {', '.join(sorted(ALLOWED_SET))}")
     print(f"📈 Tryb: PERCENT, wartość: {POSITION_VALUE}")
+    print(f"⏱️ Anti-dup: {MIN_SECONDS_BETWEEN_SAME_ACTION}s, Anti-flip CLOSE: {MIN_HOLD_SECONDS_AFTER_OPEN}s")
     app.run(host="0.0.0.0", port=PORT)
